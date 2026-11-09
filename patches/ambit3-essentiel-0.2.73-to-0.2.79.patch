@@ -1,0 +1,671 @@
+--- a/android/src/screens/HomeScreen.tsx
++++ b/android/src/screens/HomeScreen.tsx
+@@ -29,7 +29,7 @@
+ import {
+   scanAndConnect as bleScanAndConnect, scanAndConnectTo as bleScanAndConnectTo,
+   listBondedWatches, BondedWatch, onBleDisconnected,
+-  armAutoReconnect, onBleReconnected,
++  armAutoReconnect, onBleReconnected, disconnectBle,
+ } from '../native/AmbitBleModule';
+ import * as Garmin from '../native/GarminModule';
+ import type { GarminConnectResult } from '../native/GarminModule';
+@@ -597,6 +597,13 @@
+   // `targetAddress` (multi-watch switcher, 2026-08-16): when the user picked a specific paired
+   // watch, pin the scan to that one so another paired watch soliciting nearby can't be grabbed
+   // instead. Omitted (generic Bluetooth button) → connect to the first compatible watch found.
++  async function restoreWatchReconnect(targetAddress?: string) {
++    if (Platform.OS !== 'android' || bleConnectRunning.current || bleConnectedRef.current) return;
++    const address = targetAddress ?? await AsyncStorage.getItem(BLE_RECONNECT_KEY).catch(() => null);
++    if (!address || bleConnectRunning.current || bleConnectedRef.current) return;
++    autoReconnectRef.current = await armAutoReconnect(address).catch(() => false);
++  }
++
+   async function handleBleConnect(targetAddress?: string) {
+     if (bleConnectRunning.current) return;
+     bleConnectRunning.current = true;
+@@ -612,7 +619,13 @@
+     setConnectError(undefined);
+     setPhase('connecting');
+     try {
+-      const connectedAddr = await (targetAddress ? bleScanAndConnectTo(targetAddress) : bleScanAndConnect());
++      const connectWatch = () => targetAddress ? bleScanAndConnectTo(targetAddress) : bleScanAndConnect();
++      const connectedAddr = await connectWatch().catch(async error => {
++        if (Platform.OS !== 'android' || AppState.currentState !== 'active' ||
++            !['SCAN_TIMEOUT', 'BLE_INIT_FAILED'].includes(error?.code)) throw error;
++        if (error.code === 'BLE_INIT_FAILED') await disconnectBle();
++        return connectWatch();
++      });
+       let devInfo: AmbitDeviceInfo | null = null;
+       try { devInfo = await getDeviceInfo(); } catch { /* non-fatal — hide the info block below */ }
+       setAmbitInfo(devInfo);
+@@ -651,10 +664,16 @@
+       bleConnectedRef.current = false;
+       setBleTransportActive(false);
+       setConnectedBleAddress(null);
+-      setConnectError(e?.message ?? t.unknownError);
++      if (Platform.OS === 'android' && e?.code === 'BLE_INIT_FAILED') await disconnectBle().catch(() => {});
++      setConnectError(e?.code === 'SCAN_TIMEOUT'
++        ? 'Montre non détectée. Sur l’Ambit3, lance « Synchroniser maintenant » pour relancer la connexion.'
++        : e?.code === 'BLE_INIT_FAILED'
++          ? 'Montre détectée, mais ses informations n’ont pas pu être lues. Relance « Synchroniser maintenant » sur la montre.'
++          : e?.message ?? t.unknownError);
+       setPhase('connect-error');
+     } finally {
+       bleConnectRunning.current = false;
++      if (!bleConnectedRef.current) void restoreWatchReconnect(targetAddress);
+     }
+   }
+   const handleBleConnectRef = useRef(handleBleConnect);
+@@ -691,6 +710,14 @@
+     // eslint-disable-next-line react-hooks/exhaustive-deps
+   }, []);
+ 
++  useEffect(() => {
++    if (Platform.OS !== 'android') return;
++    const listener = AppState.addEventListener('change', state => {
++      if (state === 'active' && phaseRef.current !== 'connected') void restoreWatchReconnect();
++    });
++    return () => listener.remove();
++  }, []);
++
+   // The watch linked by itself (standing reconnect): same state as after Connect, then sync.
+   useEffect(() => {
+     return onBleReconnected(async ({ address }) => {
+--- a/android/src/screens/AmbitDashboard.tsx
++++ b/android/src/screens/AmbitDashboard.tsx
+@@ -1,4 +1,5 @@
+-import Svg, { Path } from 'react-native-svg';
++import RNFS from 'react-native-fs';
++import Svg, { Circle, Line, Path } from 'react-native-svg';
+ import { Linking, NativeModules, Switch, TextInput, PermissionsAndroid, Platform } from 'react-native';
+ import React, { useEffect, useState } from 'react';
+ import { View, Text, ScrollView, TouchableOpacity, StyleSheet, BackHandler } from 'react-native';
+@@ -8,6 +9,99 @@
+ import { useNavMenu, MenuItem } from '../navigation/MenuContext';
+ import { weekSteps } from '../services/AmbitSteps';
+ 
++type CardioPoint = { at: number; bpm: number };
++type CardioPeriod = 'day' | 'night';
++
++type CardioLog = { name: string; path: string; date: number };
++type CardioSummary = { points: CardioPoint[]; min: number; max: number; average: number; count: number; start: number; end: number; measuredMs: number };
++
++function parseCardioLog(csv: string): CardioSummary | null {
++  const minutes = new Map<number, { total: number; count: number }>();
++  let total = 0, count = 0, min = Infinity, max = -Infinity;
++  let start = Infinity, end = 0, previous = 0, measuredMs = 0;
++  for (const line of csv.split('\n')) {
++    const [time, value] = line.split(',');
++    const at = Number(time), bpm = Number(value);
++    if (!Number.isSafeInteger(at) || at <= 0 || !Number.isInteger(bpm) || bpm < 20 || bpm > 250) continue;
++    const minute = Math.floor(at / 60000) * 60000;
++    const bucket = minutes.get(minute) ?? { total: 0, count: 0 };
++    bucket.total += bpm;
++    bucket.count++;
++    minutes.set(minute, bucket);
++    total += bpm;
++    count++;
++    min = Math.min(min, bpm);
++    max = Math.max(max, bpm);
++    if (previous && at > previous && at - previous <= 10000) measuredMs += at - previous;
++    previous = at;
++    start = Math.min(start, at);
++    end = Math.max(end, at);
++  }
++  if (!count) return null;
++  const points = Array.from(minutes, ([at, bucket]) => ({ at, bpm: Math.round(bucket.total / bucket.count) }))
++    .sort((a, b) => a.at - b.at);
++  return { points, min, max, average: Math.round(total / count), count, start, end, measuredMs };
++}
++
++function CardioCurve({ points, color }: { points: CardioPoint[]; color: string }) {
++  const [width, setWidth] = useState(0);
++  const [cursor, setCursor] = useState<number | null>(null);
++  if (points.length < 2) return null;
++
++  const first = points[0].at;
++  const last = points[points.length - 1].at;
++  const duration = Math.max(1, last - first);
++  const min = Math.min(...points.map(p => p.bpm)) - 3;
++  const max = Math.max(...points.map(p => p.bpm)) + 3;
++  const x = (at: number) => 5 + (at - first) * 290 / duration;
++  const y = (bpm: number) => 92 - (bpm - min) * 84 / (max - min);
++  const path = points.map((point, i) => {
++    const gap = i === 0 || point.at - points[i - 1].at > 60000;
++    return `${gap ? 'M' : 'L'}${x(point.at)},${y(point.bpm)}`;
++  }).join(' ');
++  const hour = (at: number) => new Date(at).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
++  const nearest = cursor === null ? null : points.reduce((best, point) =>
++    Math.abs(point.at - cursor) < Math.abs(best.at - cursor) ? point : best);
++  const selected = nearest && cursor !== null && Math.abs(nearest.at - cursor) <= 30000 ? nearest : null;
++  const moveCursor = (locationX: number) => {
++    if (width <= 0) return;
++    const position = Math.max(0, Math.min(1, (300 * locationX / width - 5) / 290));
++    setCursor(first + position * duration);
++  };
++  const tickCount = Math.max(2, Math.min(5, Math.floor(duration / 60000) + 1));
++  const tickTimes = Array.from({ length: tickCount }, (_, i) => first + duration * i / (tickCount - 1));
++
++  return <View>
++    <Text accessibilityLiveRegion="polite" style={{ color, fontWeight: '700', marginBottom: 4 }}>
++      {selected ? `${hour(selected.at)} · ${selected.bpm} bpm`
++        : cursor === null ? 'Touche la courbe pour lire une mesure'
++        : `${hour(cursor)} · Aucune mesure`}
++    </Text>
++    <View onLayout={event => setWidth(event.nativeEvent.layout.width)}>
++      <Svg width="100%" height={116} viewBox="0 0 300 100" preserveAspectRatio="none">
++        {[8, 50, 92].map(value => <Line key={value} x1={5} y1={value} x2={295} y2={value} stroke={color} opacity={0.18} />)}
++        {tickTimes.map(at => <Line key={at} x1={x(at)} y1={8} x2={x(at)} y2={92} stroke={color} opacity={0.14} />)}
++        <Path d={path} stroke={color} strokeWidth={2} fill="none" />
++        {points.map((point, i) => {
++          const isolated = (!i || point.at - points[i - 1].at > 60000) &&
++            (i === points.length - 1 || points[i + 1].at - point.at > 60000);
++          return isolated ? <Circle key={point.at} cx={x(point.at)} cy={y(point.bpm)} r={2} fill={color} /> : null;
++        })}
++        {cursor !== null && <Line x1={x(selected?.at ?? cursor)} y1={8} x2={x(selected?.at ?? cursor)} y2={92}
++          stroke={color} opacity={0.6} />}
++        {selected && <Circle cx={x(selected.at)} cy={y(selected.bpm)} r={4} fill={color} />}
++      </Svg>
++      <View style={StyleSheet.absoluteFillObject} accessibilityLabel="Courbe cardio, moyennes par minute"
++        onStartShouldSetResponder={() => true}
++        onResponderGrant={event => moveCursor(event.nativeEvent.locationX)}
++        onResponderMove={event => moveCursor(event.nativeEvent.locationX)} />
++    </View>
++    <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
++      {tickTimes.map(at => <Text key={at} style={{ color, fontSize: 11 }}>{hour(at)}</Text>)}
++    </View>
++  </View>;
++}
++
+ type Tab = 'today' | 'history' | 'sports' | 'watch';
+ interface Props {
+   backgroundMinutes: number; onBackground: (minutes: number) => void;
+@@ -37,13 +131,19 @@
+     }
+   }
+   const [tab, setTab] = useState<Tab>('today');
+-  const [night, setNight] = useState<{ state: string; mode: 'day' | 'night'; count: number; last: number; minimum: number; average: number } | null>(null);
++  const [historyCardioOpen, setHistoryCardioOpen] = useState(false);
++  const showCardioLogs = tab === 'today' || (tab === 'history' && historyCardioOpen);
++  const showCardioStatus = showCardioLogs || tab === 'watch';
++  const [night, setNight] = useState<{ state: string; mode: 'day' | 'night'; count: number; last: number; minimum: number; average: number; scheduledStart?: number; scheduledEnd?: number; curves?: Partial<Record<CardioPeriod, CardioPoint[]>> } | null>(null);
++  const [cardioPeriod, setCardioPeriod] = useState<CardioPeriod | null>(null);
+   const [nightError, setNightError] = useState('');
++  const [nightStart, setNightStart] = useState('23:00');
++  const [nightEnd, setNightEnd] = useState('07:00');
+   const [nightPending, setNightPending] = useState(false);
+-  const nightRunning = ['scanning', 'connecting', 'recording', 'reconnecting'].includes(night?.state ?? '');
++  const nightRunning = ['scheduled', 'scanning', 'connecting', 'recording', 'reconnecting'].includes(night?.state ?? '');
+ 
+   useEffect(() => {
+-    if (!focused || tab !== 'today' || Platform.OS !== 'android') return;
++    if (!focused || !showCardioStatus || Platform.OS !== 'android') return;
+     let active = true;
+     const refresh = async () => {
+       try {
+@@ -56,9 +156,45 @@
+     void refresh();
+     const timer = setInterval(refresh, 3000);
+     return () => { active = false; clearInterval(timer); };
+-  }, [focused, tab]);
++  }, [focused, showCardioStatus]);
++
++  const shownPeriod = cardioPeriod ?? night?.mode ?? 'day';
++  const [cardioLogs, setCardioLogs] = useState<CardioLog[]>([]);
++  const [selectedLog, setSelectedLog] = useState<string | null>(null);
++  const [cardioHistory, setCardioHistory] = useState<{ path: string; summary: CardioSummary | null } | null>(null);
++  const [historyError, setHistoryError] = useState(false);
++  const visibleLogs = cardioLogs.filter(log => log.name.startsWith(shownPeriod === 'day' ? 'cardio-jour' : 'cardio-nuit'));
++  const logPath = visibleLogs.find(log => log.path === selectedLog)?.path ?? visibleLogs[0]?.path;
++  const summary = cardioHistory?.path === logPath ? cardioHistory?.summary : null;
++  const cardioPoints = summary?.points ?? [];
++
++  useEffect(() => {
++    if (!focused || !showCardioLogs || Platform.OS !== 'android') return;
++    let active = true;
++    RNFS.readDir(RNFS.DocumentDirectoryPath).then(files => {
++      if (!active) return;
++      setCardioLogs(files.filter(file => /^cardio-(jour|nuit)(-[^/]+)?\.csv$/.test(file.name) && file.size > 17)
++        .map(file => ({ name: file.name, path: file.path, date: file.mtime?.getTime() ?? 0 }))
++        .sort((a, b) => b.date - a.date));
++      setHistoryError(false);
++    }).catch(() => { if (active) setHistoryError(true); });
++    return () => { active = false; };
++  }, [focused, showCardioLogs, night?.count, night?.state]);
+ 
+-  async function toggleNight(mode: 'day' | 'night') {
++  const logDate = visibleLogs.find(log => log.path === logPath)?.date;
++  useEffect(() => {
++    if (!focused || !showCardioLogs || !logPath) return;
++    let active = true;
++    RNFS.readFile(logPath, 'utf8').then(csv => {
++      if (active) {
++        setCardioHistory({ path: logPath, summary: parseCardioLog(csv) });
++        setHistoryError(false);
++      }
++    }).catch(() => { if (active) setHistoryError(true); });
++    return () => { active = false; };
++  }, [focused, showCardioLogs, logPath, logDate, night?.count]);
++
++  async function toggleNight(mode: 'day' | 'night', schedule?: { start: number; end: number }) {
+     setNightPending(true);
+     setNightError('');
+     try {
+@@ -74,13 +210,35 @@
+         setNightError('Autorisez le Bluetooth pour lire la ceinture.');
+         return;
+       }
+-      setNight(await NativeModules.AmbitBleModule.startNightHeartRate(mode));
++      setNight(await NativeModules.AmbitBleModule.startNightHeartRate(schedule ? `schedule:${schedule.start}:${schedule.end}` : mode));
++      setCardioPeriod(mode);
++      setSelectedLog(null);
+     } catch (error) {
+       setNightError(error instanceof Error ? error.message : 'Ceinture indisponible.');
+     } finally {
+       setNightPending(false);
+     }
+   }
++  function programNight() {
++    const parse = (value: string) => {
++      const match = /^(\d{1,2}):(\d{2})$/.exec(value.trim());
++      if (!match || Number(match[1]) > 23 || Number(match[2]) > 59) return -1;
++      return Number(match[1]) * 60 + Number(match[2]);
++    };
++    const from = parse(nightStart), to = parse(nightEnd);
++    if (from < 0 || to < 0 || from === to) {
++      setNightError('Saisis deux heures différentes au format HH:MM.');
++      return;
++    }
++    const now = new Date();
++    const start = new Date(now);
++    start.setHours(Math.floor(from / 60), from % 60, 0, 0);
++    if (start <= now) start.setDate(start.getDate() + 1);
++    const end = new Date(start);
++    end.setHours(Math.floor(to / 60), to % 60, 0, 0);
++    if (to < from) end.setDate(end.getDate() + 1);
++    void toggleNight('night', { start: start.getTime(), end: end.getTime() });
++  }
+   const [appSettingsOpen, setAppSettingsOpen] = useState(false);
+   const [relay, setRelay] = useState<{ access: boolean; quiet: boolean; ready: boolean; events: number; requests: number; sendErrors: number; scheduledQuiet: boolean; quietStart: number; quietEnd: number } | null>(null);
+   const [quietStart, setQuietStart] = useState<string | null>(null);
+@@ -140,8 +298,8 @@
+   const today = week.days.find(d => d.today);
+   const canWrite = p.connected && !p.busy && !p.connecting;
+   function open(id: string) { p.items.find(i => i.id === id)?.onPress(); }
+-  function action(label: string, press: () => void, disabled = false, primary = false) {
+-    return <TouchableOpacity accessibilityRole="button" accessibilityState={{ disabled }} disabled={disabled}
++  function action(label: string, press: () => void, disabled = false, primary = false, key?: string) {
++    return <TouchableOpacity key={key} accessibilityRole="button" accessibilityState={{ disabled }} disabled={disabled}
+       onPress={press} style={[s.button, { backgroundColor: primary ? th.primary : th.card, opacity: disabled ? 0.45 : 1 }]}>
+       <Text style={{ color: primary ? th.background : th.text, fontSize: 16, fontWeight: '600', textAlign: 'center' }}>{label}</Text>
+     </TouchableOpacity>;
+@@ -198,7 +356,8 @@
+         {Platform.OS === 'android' && <View style={card}>
+           <Text style={title}>Cardio avec ceinture</Text>
+           {night && night.state !== 'idle' && <Text style={text}>{night.mode === 'day' ? 'Journée' : 'Nuit'}</Text>}
+-          <Text style={muted}>{night?.state === 'scanning' ? 'Recherche de la ceinture Suunto…'
++          <Text style={muted}>{night?.state === 'scheduled' ? `Départ prévu le ${new Date(night.scheduledStart ?? 0).toLocaleString('fr-FR')} · arrêt le ${new Date(night.scheduledEnd ?? 0).toLocaleString('fr-FR')}`
++            : night?.state === 'scanning' ? 'Recherche de la ceinture Suunto…'
+             : night?.state === 'connecting' ? 'Connexion à la ceinture…'
+             : night?.state === 'reconnecting' ? 'Reconnexion à la même ceinture…'
+             : night?.state === 'recording' ? 'Enregistrement en cours'
+@@ -208,15 +367,57 @@
+           {night && night.count > 0 && <Text style={text}>
+             {night.last} bpm · Moy. {night.average} · Min. {night.minimum} · {night.count} mesures
+           </Text>}
+-          {nightRunning ? action('Arrêter le suivi', () => { void toggleNight(night?.mode ?? 'night'); }, nightPending)
++          {nightRunning ? action(night?.state === 'scheduled' ? 'Annuler la programmation' : 'Arrêter le suivi', () => { void toggleNight(night?.mode ?? 'night'); }, nightPending)
+             : <>{action('Démarrer le cardio journée', () => { void toggleNight('day'); }, nightPending)}
+                 {action('Démarrer le cardio de nuit', () => { void toggleNight('night'); }, nightPending)}</>}
++          {action('Ouvrir l’historique cardio', () => { setHistoryCardioOpen(true); setTab('history'); })}
++          {!nightRunning && <>
++            <Text style={title}>Programmer la prochaine nuit</Text>
++            <View style={s.row}>
++              <TextInput accessibilityLabel="Heure de début" value={nightStart} onChangeText={setNightStart}
++                maxLength={5} style={[text, { flex: 1, padding: 8 }]} />
++              <Text style={muted}>à</Text>
++              <TextInput accessibilityLabel="Heure de fin" value={nightEnd} onChangeText={setNightEnd}
++                maxLength={5} style={[text, { flex: 1, padding: 8 }]} />
++            </View>
++            {action('Programmer cette plage', programNight, nightPending)}
++            <Text style={muted}>Pour la prochaine nuit. Android peut décaler le déclenchement.</Text>
++          </>}
+           {!!nightError && <Text style={muted}>{nightError}</Text>}
+           <Text style={muted}>Le suivi peut continuer écran éteint avec le service Android actif. Il ne détermine pas les phases du sommeil.</Text>
+         </View>}
+         {p.lastActivity && <View style={card}><Text style={title}>Dernière séance</Text><Text style={text}>{p.lastActivity.activity_type || 'Activité'}</Text><Text style={muted}>{new Date(p.lastActivity.date).toLocaleDateString('fr-FR')} · {(p.lastActivity.distance_m / 1000).toFixed(1)} km · {Math.round(p.lastActivity.duration_s / 60)} min</Text>{!!p.lastActivity.energy_kcal && <Text style={muted}>{p.lastActivity.energy_kcal.toLocaleString('fr-FR')} kcal</Text>}{action('Voir mes séances', () => open('activities'))}</View>}
+       </>}
+       {tab === 'history' && <>
++        {Platform.OS === 'android' && <View style={card}>
++          <Text style={title}>Historique cardio</Text>
++          {action(historyCardioOpen ? 'Masquer les relevés' : 'Voir les relevés jour et nuit',
++            () => setHistoryCardioOpen(open => !open))}
++          {historyCardioOpen && <>
++          <View style={s.row}>
++            {action(shownPeriod === 'day' ? 'Journée ✓' : 'Journée', () => { setCardioPeriod('day'); setSelectedLog(null); })}
++            {action(shownPeriod === 'night' ? 'Nuit ✓' : 'Nuit', () => { setCardioPeriod('night'); setSelectedLog(null); })}
++          </View>
++          {visibleLogs.length > 0 && <ScrollView horizontal showsHorizontalScrollIndicator={false}>
++            {visibleLogs.map(log => action(
++              new Date(log.date).toLocaleString('fr-FR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })
++                + (log.path === logPath ? ' ✓' : ''),
++              () => setSelectedLog(log.path), false, log.path === logPath, log.path))}
++          </ScrollView>}
++          {summary && <Text style={text}>
++            Moy. {summary.average} bpm · Min. {summary.min} · Max. {summary.max} · {summary.count} mesures
++          </Text>}
++          {summary && <Text style={muted}>
++            {new Date(summary.start).toLocaleString('fr-FR')} → {new Date(summary.end).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })}
++            {'\n'}Temps couvert estimé · {Math.floor(summary.measuredMs / 60000)} min {Math.floor(summary.measuredMs / 1000) % 60} s
++            {summary.end > summary.start ? ` · ${Math.round(100 * summary.measuredMs / (summary.end - summary.start))} % du relevé` : ''}
++          </Text>}
++          {historyError && <Text style={muted}>Historique cardio indisponible.</Text>}
++          {cardioPoints.length > 1
++            ? <CardioCurve key={logPath ?? shownPeriod} points={cardioPoints} color={th.primary} />
++            : <Text style={muted}>{visibleLogs.length ? 'La courbe apparaît après deux minutes de mesure distinctes.' : 'Aucun relevé pour cette période.'}</Text>}
++          </>}
++        </View>}
+         {stepsCard}
+         <View style={card}><Text style={title}>Cette semaine</Text><Text style={[s.count, text]}>{week.days.some(d => d.steps >= 0) ? week.total.toLocaleString('fr-FR') : 'Non lus'}</Text><Text style={muted}>Total des pas disponibles · les jours non lus ne sont pas comptés.</Text></View>
+         {action(p.busy ? 'Opération en cours…' : 'Synchroniser les séances', p.onSync, !canWrite, true)}
+@@ -240,6 +441,13 @@
+         <View style={card}><Text style={title}>Connexion</Text><Text style={muted}>{p.name} · {p.connected ? 'Connectée' : 'Non connectée'}</Text>
+           {!p.connected && action('Connecter / appairer', p.onConnect, p.busy || p.connecting, true)}
+           <Text style={muted}>En cas d’échec : rapprochez la montre et fermez les autres applications qui utilisent sa connexion.</Text></View>
++        {p.items.some(item => item.id === 'smartSensor') && <View style={card}>
++          <Text style={title}>Ceinture Suunto Smart Sensor</Text>
++          <Text style={muted}>{nightRunning
++            ? 'Arrête le suivi cardio avant de lancer le diagnostic.'
++            : 'Vérifie le signal et le niveau de pile si la ceinture le transmet.'}</Text>
++          {action('Diagnostic de la ceinture', () => open('smartSensor'), nightRunning || p.busy)}
++        </View>}
+         <View style={card}><Text style={title}>Notifications sur la montre</Text><Text style={muted}>{relay?.quiet ? 'Relais en pause manuelle' : relay?.scheduledQuiet ? 'Créneau silencieux en cours' : !relay?.access ? 'Accès Android à autoriser' : relay.ready ? 'Montre abonnée au relais' : 'En attente de l’abonnement de la montre'}</Text>{action('Ouvrir l’accès aux notifications', () => {
+           Linking.sendIntent('android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS').catch(() => {});
+         })}
+--- a/android/src/components/activity/ActivityPanel.tsx
++++ b/android/src/components/activity/ActivityPanel.tsx
+@@ -301,6 +301,37 @@
+     </TouchableOpacity>
+   );
+ 
++  const cardioChannel = chans.find(c => c.id === 'hr');
++  const cardioZones = zoneKinds.find(z => z.kind === 'hr');
++  const renderZones = (zone: { kind: string; times: number[]; text: string }, withPicker: boolean) => (
++    <View style={{ marginTop: 12 }}>
++      <View style={s.zoneHead}>
++        <Text style={s.zoneTitle}>{zone.kind === 'power' ? 'Time in power zones' : 'Temps par zone cardio'}</Text>
++        {withPicker && zoneKinds.length > 1 && (
++          <View style={s.wrapRow}>
++            {zoneKinds.map(z => <Seg key={z.kind} t={t} label={z.kind === 'power' ? 'Power' : 'Heart rate'} on={zone.kind === z.kind} onPress={() => setZoneKind(z.kind)} />)}
++          </View>)}
++      </View>
++      <View style={s.zoneBar}>
++        {zone.times.map((sec: number, i: number) => {
++          const tot = zone.times.reduce((a: number, b: number) => a + b, 0);
++          return sec / tot > 0.002 ? <View key={i} style={{ flex: sec, backgroundColor: zonePalette['z' + (i + 1)], height: 12, borderRadius: 4, marginRight: 2 }} /> : null;
++        })}
++      </View>
++      <View style={s.wrapRow}>
++        {zone.times.map((sec: number, i: number) => {
++          const tot = zone.times.reduce((a: number, b: number) => a + b, 0);
++          return sec > 0 ? (
++            <View key={i} style={s.legendItem}>
++              <View style={[s.swatch, { backgroundColor: zonePalette['z' + (i + 1)] }]} />
++              <Text style={s.legendText}>Z{i + 1} {AVL.fmtClock(sec)} · {Math.round(100 * sec / tot)}%</Text>
++            </View>) : null;
++        })}
++      </View>
++      <Text style={s.caption}>{zone.text}</Text>
++    </View>
++  );
++
+   return (
+     <View style={s.panel}>
+       {!hasMap || colourModes.length === 0 ? null : (
+@@ -329,37 +360,25 @@
+ 
+       {tab === 'overview' && (
+         <View style={s.card}>
++          {cardioChannel && !swimMode ? (
++            <Seg t={t} label="Voir la courbe cardio" on={false} onPress={() => {
++              setChanOn({ hr: true });
++              setFocusId('hr');
++              setXDist(false);
++              setZoom(null);
++              setHover(-1);
++              onHover(null);
++              onStretch(null);
++              setTab('charts');
++            }} />
++          ) : !loading && !swimMode && !!(meta?.avgHr || meta?.maxHr) ? (
++            <Text style={s.caption}>Courbe cardio indisponible pour cette séance.</Text>
++          ) : null}
+           <View style={s.grid}>{ov.headline.map((m: any) => <Stat key={m.key} m={m} big />)}</View>
+           {!!usual && (
+             <View style={s.usual}><Text style={s.usualIcon}>{usual.tone === 'best' ? '★' : '↗'}</Text><Text style={s.usualText}>{usual.text}</Text></View>)}
+           {ov.secondary.length > 0 && <View style={s.grid}>{ov.secondary.map((m: any) => <Stat key={m.key} m={m} />)}</View>}
+-          {!!zoneShown && (
+-            <View style={{ marginTop: 12 }}>
+-              <View style={s.zoneHead}>
+-                <Text style={s.zoneTitle}>{zoneShown.kind === 'power' ? 'Time in power zones' : 'Time in heart-rate zones'}</Text>
+-                {zoneKinds.length > 1 && (
+-                  <View style={s.wrapRow}>
+-                    {zoneKinds.map(z => <Seg key={z.kind} t={t} label={z.kind === 'power' ? 'Power' : 'Heart rate'} on={zoneShown.kind === z.kind} onPress={() => setZoneKind(z.kind)} />)}
+-                  </View>)}
+-              </View>
+-              <View style={s.zoneBar}>
+-                {zoneShown.times.map((sec: number, i: number) => {
+-                  const tot = zoneShown.times.reduce((a: number, b: number) => a + b, 0);
+-                  return sec / tot > 0.002 ? <View key={i} style={{ flex: sec, backgroundColor: zonePalette['z' + (i + 1)], height: 12, borderRadius: 4, marginRight: 2 }} /> : null;
+-                })}
+-              </View>
+-              <View style={s.wrapRow}>
+-                {zoneShown.times.map((sec: number, i: number) => {
+-                  const tot = zoneShown.times.reduce((a: number, b: number) => a + b, 0);
+-                  return sec > 0 ? (
+-                    <View key={i} style={s.legendItem}>
+-                      <View style={[s.swatch, { backgroundColor: zonePalette['z' + (i + 1)] }]} />
+-                      <Text style={s.legendText}>Z{i + 1} {AVL.fmtClock(sec)} · {Math.round(100 * sec / tot)}%</Text>
+-                    </View>) : null;
+-                })}
+-              </View>
+-              <Text style={s.caption}>{zoneShown.text}</Text>
+-            </View>)}
++          {zoneShown && renderZones(zoneShown, true)}
+           {ov.more.length > 0 && (
+             <View style={s.more}>
+               <TouchableOpacity onPress={() => setMoreOpen(o => !o)} style={s.moreHead}>
+@@ -423,6 +442,7 @@
+             scrollEnabled={false}
+             onMessage={onChartMessage}
+           />
++          {cardioZones && (swimMode ? swimHr : chanOn.hr) && renderZones(cardioZones, false)}
+           {!!planned && !swimMode && (
+             <Text style={[s.caption, { color: t.text }]}>
+               Planned on intervals.icu: {planned.name} ({AVL.fmtClock(planned.blocks[planned.blocks.length - 1].t1)}). Its power targets are the shaded blocks behind your power, on the time axis.
+--- a/android/android/app/src/main/java/com/ambitsyncmodern/ble/NightHeartRate.kt
++++ b/android/android/app/src/main/java/com/ambitsyncmodern/ble/NightHeartRate.kt
+@@ -4,6 +4,9 @@
+ import com.ambitsportlocal.background.SyncService
+ import android.bluetooth.le.ScanCallback
+ import android.bluetooth.le.ScanResult
++import android.bluetooth.le.ScanFilter
++import android.bluetooth.le.ScanSettings
++import android.os.ParcelUuid
+ import android.content.Context
+ import android.os.Handler
+ import android.os.Looper
+@@ -26,6 +29,8 @@
+     private var total = 0L
+     private var last = 0
+     private var minimum = 0
++    private data class CardioPoint(val at: Long, var sum: Int, var count: Int)
++    private val curves = mutableMapOf<String, ArrayDeque<CardioPoint>>()
+     private var lastSample = 0L
+     private var log: File? = null
+     private var belt: BluetoothDevice? = null
+@@ -66,15 +71,38 @@
+         main.postDelayed(reconnect, delay)
+     }
+ 
++    private var scheduledStart = 0L
++    private var scheduledEnd = 0L
++
+     fun start(requestedMode: String) {
++        if (requestedMode.startsWith("schedule:")) {
++            val parts = requestedMode.split(':')
++            require(parts.size == 3)
++            val startAt = parts[1].toLong()
++            val endAt = parts[2].toLong()
++            require(endAt > startAt && endAt > System.currentTimeMillis())
++            if (state in listOf("scanning", "connecting", "recording", "reconnecting", "scheduled")) return
++            SyncService.scheduleNight(context, startAt, endAt, {
++                if (System.currentTimeMillis() < scheduledEnd) {
++                    runCatching { start("night") }.onFailure { finish("error") }
++                } else finish("done")
++            }, { finish("stopped") })
++            scheduledStart = startAt
++            scheduledEnd = endAt
++            mode = "night"
++            state = "scheduled"
++            return
++        }
+         require(requestedMode == "day" || requestedMode == "night")
+         if (state in listOf("scanning", "connecting", "recording", "reconnecting")) return
++        if (state == "scheduled" && requestedMode != "night") return
+         val scanner = adapter?.bluetoothLeScanner ?: error("Bluetooth indisponible")
+         mode = requestedMode
+         val filename = if (mode == "day") "cardio-jour.csv" else "cardio-nuit.csv"
+-        val file = File(context.filesDir, filename)
++        val file = File.createTempFile(filename.removeSuffix(".csv") + "-", ".csv", context.filesDir)
+         file.writeText("timestamp_ms,bpm\n")
+         log = file
++        curves[mode] = ArrayDeque()
+         belt = null
+         retries = 0
+         count = 0
+@@ -108,7 +136,13 @@
+         scan = callback
+         try {
+             SyncService.beginNight(context) { finish("stopped") }
+-            scanner.startScan(callback)
++            if (scheduledEnd > 0) {
++                val filters = listOf(
++                    ScanFilter.Builder().setServiceUuid(ParcelUuid(heartRate)).build(),
++                    ScanFilter.Builder().setDeviceName("Suunto Smart Sensor").build()
++                )
++                scanner.startScan(filters, ScanSettings.Builder().build(), callback)
++            } else scanner.startScan(callback)
+             main.postDelayed(timeout, 30000)
+         } catch (e: RuntimeException) {
+             finish("error")
+@@ -169,6 +203,16 @@
+             if (now - lastSample < 5000) return@post
+             try {
+                 log?.appendText("$now,$bpm\n")
++                val curve = curves.getOrPut(mode) { ArrayDeque() }
++                val minute = now / 60000 * 60000
++                val point = curve.lastOrNull()
++                if (point?.at == minute) {
++                    point.sum += bpm
++                    point.count++
++                } else {
++                    curve.addLast(CardioPoint(minute, bpm, 1))
++                    if (curve.size > 1440) curve.removeFirst()
++                }
+                 lastSample = now
+                 last = bpm
+                 minimum = if (count == 0) bpm else minOf(minimum, bpm)
+@@ -196,11 +240,27 @@
+         stopScan()
+         closeConnection()
+         belt = null
++        scheduledStart = 0L
++        scheduledEnd = 0L
+         state = result
+         SyncService.endNight(context)
+     }
+ 
+     fun snapshot() = Arguments.createMap().apply {
++        putMap("curves", Arguments.createMap().apply {
++            for ((period, curve) in curves) {
++                putArray(period, Arguments.createArray().apply {
++                    for (point in curve) {
++                        pushMap(Arguments.createMap().apply {
++                            putDouble("at", point.at.toDouble())
++                            putInt("bpm", point.sum / point.count)
++                        })
++                    }
++                })
++            }
++        })
++        putDouble("scheduledStart", scheduledStart.toDouble())
++        putDouble("scheduledEnd", scheduledEnd.toDouble())
+         putString("state", state)
+         putString("mode", mode)
+         putInt("count", count)
+--- a/android/android/app/src/main/java/com/ambitsportlocal/background/SyncService.java
++++ b/android/android/app/src/main/java/com/ambitsportlocal/background/SyncService.java
+@@ -17,6 +17,30 @@
+     private int minutes;
+     static boolean running = false;
+     private static Runnable stopNight;
++    private static Runnable startScheduledNight;
++    private static final String CARDIO_START = "CARDIO_START";
++    private static final String CARDIO_END = "CARDIO_END";
++
++    private static PendingIntent cardioAlarm(Context context, String action, int id) {
++        return PendingIntent.getForegroundService(context, id,
++            new Intent(context, SyncService.class).setAction(action),
++            PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
++    }
++
++    public static void scheduleNight(Context context, long start, long end, Runnable onStart, Runnable onStop) {
++        beginNight(context, onStop);
++        startScheduledNight = onStart;
++        AlarmManager alarms = context.getSystemService(AlarmManager.class);
++        alarms.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, start, cardioAlarm(context, CARDIO_START, 3110));
++        alarms.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, end, cardioAlarm(context, CARDIO_END, 3111));
++    }
++
++    private static void cancelNightAlarms(Context context) {
++        startScheduledNight = null;
++        AlarmManager alarms = context.getSystemService(AlarmManager.class);
++        alarms.cancel(cardioAlarm(context, CARDIO_START, 3110));
++        alarms.cancel(cardioAlarm(context, CARDIO_END, 3111));
++    }
+ 
+     public static boolean isNightActive() { return stopNight != null; }
+ 
+@@ -31,6 +55,7 @@
+     }
+ 
+     public static void endNight(Context context) {
++        cancelNightAlarms(context);
+         if (stopNight == null) return;
+         stopNight = null;
+         if (context.getSharedPreferences(PREFS, 0).getInt("minutes", 0) == 0) {
+@@ -98,6 +123,15 @@
+             }
+         }
+         else startForeground(ID, notification);
++        if (intent != null && CARDIO_START.equals(intent.getAction())) {
++            Runnable start = startScheduledNight;
++            startScheduledNight = null;
++            if (start != null) start.run();
++        }
++        if (intent != null && CARDIO_END.equals(intent.getAction()) && stopNight != null) {
++            stopNight.run();
++            return START_NOT_STICKY;
++        }
+         running = true;
+         emit(this, "AmbitBackgroundState", minutes);
+         if (minutes > 0 && intent != null && "TICK".equals(intent.getAction())) {
+@@ -133,6 +167,7 @@
+ 
+     @Override public void onDestroy() {
+         if (weatherRequest != null) weatherRequest.cancel();
++        cancelNightAlarms(this);
+         Runnable onStop = stopNight;
+         stopNight = null;
+         if (onStop != null) onStop.run();
